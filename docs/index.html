@@ -1,13 +1,17 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Live Camera Classifier</title>
+  <title>Live Classification</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="script.js" defer></script>
+  <style>
+    video { width: 320px; height: auto; }
+    #result { font-size: 1.5em; }
+  </style>
 </head>
 <body>
-  <video id="webcam" autoplay playsinline width="640" height="480"></video>
-  <pre id="result"></pre>
-  <script src="script.js"></script>
+  <h1>Live Camera Classifier</h1>
+  <video id="webcam" autoplay></video>
+  <p id="result">Loading...</p>
 </body>
 </html>
