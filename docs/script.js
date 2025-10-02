@@ -1,3 +1,9 @@
+// Put these at the top of your script (globals)
+let frameCount = 0;
+let lastReport = performance.now();
+
+
+
 let model;
 const classLabels = ['Big Lot', 'C Press', 'Snyders'];
 
@@ -148,3 +154,17 @@ async function start() {
 }
 
 start();
+// Inside the end of your loop, after you update UI:
+frameCount++;
+const now = performance.now();
+if (now - lastReport > 2000) { // every ~2s
+  const mem = tf.engine().memory();
+  console.log(
+    `fps≈${(frameCount/((now-lastReport)/1000)).toFixed(1)}`,
+    `tensors=${mem.numTensors}`,
+    `bytes=${(mem.numBytes/1e6).toFixed(2)}MB`,
+    `backend=${tf.getBackend()}`
+  );
+  frameCount = 0;
+  lastReport = now;
+}
