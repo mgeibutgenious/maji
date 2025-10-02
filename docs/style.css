@@ -18,7 +18,9 @@ canvas {
 }
 
 #result {
-    font-size: 20px;
-    margin-top: 10px;
-    color: #333;
+  font-size: 1.2em;
+  line-height: 1.5;
+  margin-top: 15px;
+  text-align: center;
 }
+
