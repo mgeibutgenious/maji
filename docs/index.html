@@ -1,16 +1,53 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-  <title>Live Classifier</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-  <script defer src="script.js"></script>
-  <style>
-    video, canvas { display: block; margin: auto; }
-    h2 { text-align: center; }
-  </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Camera Classifier</title>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <h2 id="label">Loading model...</h2>
-  <video id="webcam" autoplay playsinline width="224" height="224"></video>
+  <header>
+    <h1>Live Camera Classifier</h1>
+  </header>
+
+  <main>
+    <!-- Square camera preview -->
+    <video id="webcam" autoplay playsinline muted></video>
+
+    <!-- Progress bars (created once, only widths/text updated each frame) -->
+    <div id="results">
+      <div class="row">
+        <span class="label">Big Lot</span>
+        <div class="bar"><div class="fill" id="bar-0"></div></div>
+        <span class="pct" id="pct-0">0%</span>
+      </div>
+      <div class="row">
+        <span class="label">C Press</span>
+        <div class="bar"><div class="fill" id="bar-1"></div></div>
+        <span class="pct" id="pct-1">0%</span>
+      </div>
+      <div class="row">
+        <span class="label">Snyders</span>
+        <div class="bar"><div class="fill" id="bar-2"></div></div>
+        <span class="pct" id="pct-2">0%</span>
+      </div>
+    </div>
+
+    <!-- Optional text list (vertical) -->
+    <div id="resultText" aria-live="polite"></div>
+  </main>
+
+  <footer>
+    <small id="status">Loading model…</small>
+  </footer>
+
+  <!-- App -->
+  <script src="./script.js" defer></script>
 </body>
 </html>
