@@ -20,7 +20,6 @@
     .controls { margin-top:8px; display:flex; gap:8px; }
     .controls > button { padding:8px 12px; border-radius:8px; border:1px solid #d1d5db; background:#fff; cursor:pointer; }
     #err { color:#b91c1c; white-space: pre-wrap; margin-top:6px; font-size:12px; }
-    #offscreen { display:none; }
   </style>
 </head>
 <body>
@@ -42,15 +41,15 @@
     <div id="err"></div>
   </div>
 
-  <canvas id="offscreen" width="224" height="224"></canvas>
-
   <script>
     // ====== CONFIG (adjust these) ======
-    const MODEL_URL = 'tfjs_model/model.json';              // ← your model path
-    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders']; // ← your classes
-    const INPUT_SIZE = 224;                                  // ← must match your model
+    const MODEL_URL = 'tfjs_model/model.json';                   // ← your model path
+    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders'];      // ← your classes (order MUST match training)
+    const INPUT_SIZE = 224;                                      // ← must match your model input
 
-    // We do NOT convert outputs. We use raw model output directly.
+    // Keep EXACT behavior (no conversion). If your training actually used /255 or BGR, flip these:
+    const DIVIDE_BY_255 = false;   // set true ONLY if you trained with inputs scaled to 0–1
+    const RGB_TO_BGR   = false;    // set true ONLY if you trained with BGR channel order (e.g., OpenCV)
 
     let model, video, running = false, frame = 0;
 
@@ -76,37 +75,38 @@
       return video;
     }
 
-    // ====== Preprocess (kept simple and same spirit as before) ======
+    // ====== Preprocess (match your previous approach) ======
+    // fromPixels(video) -> resizeNearestNeighbor -> toFloat()
+    // Optional: channel swap or /255 if you toggle the flags above.
     function preprocess(video) {
-      const canvas = document.getElementById('offscreen');
-      canvas.width = INPUT_SIZE; canvas.height = INPUT_SIZE;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
-
-      // Keep the typical scaling to [0,1]; if you truly want raw 0–255, change div(255) to .div(1)
       return tf.tidy(() => {
-        const img = tf.browser.fromPixels(canvas).toFloat().div(255.0); // [H,W,3]
-        return img.expandDims(0); // [1,H,W,3]
+        let img = tf.browser.fromPixels(video); // [H,W,3] uint8 RGB
+        img = tf.image.resizeNearestNeighbor(img, [INPUT_SIZE, INPUT_SIZE], true);
+        let f = img.toFloat();                  // [H,W,3] float32 0..255
+
+        if (RGB_TO_BGR) f = f.reverse(-1);     // swap channels if trained with BGR
+        if (DIVIDE_BY_255) f = f.div(255.0);   // enable only if training did /255
+
+        return f.expandDims(0);                // [1,H,W,3]
       });
     }
 
-    // ====== Use RAW OUTPUT, no softmax/normalization ======
+    // ====== RAW OUTPUT (no softmax/normalization) ======
     async function getRawOutputs(tensorOrArray) {
       const t = Array.isArray(tensorOrArray) ? tensorOrArray[0] : tensorOrArray; // [1,C] or [C]
       const flat = t.rank === 2 ? t.squeeze([0]) : t; // [C]
-      const arr = await flat.data();                  // raw values as-is
+      const arr = await flat.data();                  // raw numbers as-is
       if (t !== flat) flat.dispose();
       return arr;
     }
 
-    // ====== Render ======
+    // ====== Render (vertical, top = green bold) ======
     function renderPredictions(values) {
       const items = CLASS_LABELS.map((label, i) => ({ label, v: values[i] ?? 0 }));
       let bestIdx = 0, bestVal = -Infinity;
       for (let i = 0; i < items.length; i++) if (items[i].v > bestVal) { bestVal = items[i].v; bestIdx = i; }
 
-      // If your outputs are already probabilities (0..1), this prints % nicely.
-      // If not, it will still display “as-is ×100” to keep the same visual style.
+      // Visualizing as “×100%” to keep your UI look; this does NOT change the calculation.
       document.getElementById('result').textContent =
         `${items[bestIdx].label}（${(items[bestIdx].v * 100).toFixed(1)}%）`;
 
@@ -183,7 +183,7 @@
     document.getElementById('startBtn')?.addEventListener('click', start);
     document.getElementById('stopBtn')?.addEventListener('click', stop);
 
-    (async () => { await selectBackend(); /* 自動開始したい場合は↓を有効化 */ /* await start(); */ })();
+    (async () => { await selectBackend(); /* 自動開始したい場合は↓有効化 */ /* await start(); */ })();
     window.addEventListener('pagehide', disposeAll);
     window.addEventListener('beforeunload', disposeAll);
   </script>
