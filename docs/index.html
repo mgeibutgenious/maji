@@ -46,25 +46,19 @@
 
   <script>
     // ====== CONFIG (adjust these) ======
-    const MODEL_URL = 'tfjs_model/model.json'; // ← your model path
+    const MODEL_URL = 'tfjs_model/model.json';              // ← your model path
     const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders']; // ← your classes
-    const INPUT_SIZE = 224; // ← must match your model
+    const INPUT_SIZE = 224;                                  // ← must match your model
 
-    // Output handling:
-    const APPLY_SOFTMAX = true;   // true if model outputs logits; false if model already outputs probabilities
-    // Input normalization:
-    const USE_STANDARDIZE = false;          // true if you trained with mean/std normalization
-    const MEAN = [0.485, 0.456, 0.406];     // typical ImageNet means (RGB, scaled 0–1)
-    const STD  = [0.229, 0.224, 0.225];     // typical ImageNet stds (RGB, scaled 0–1)
+    // We do NOT convert outputs. We use raw model output directly.
 
-    // ====== Globals ======
     let model, video, running = false, frame = 0;
 
     // ====== Backend selection ======
     async function selectBackend() {
-      try { await tf.setBackend('webgl'); } catch (e) {}
+      try { await tf.setBackend('webgl'); } catch (_) {}
       if (tf.getBackend() !== 'webgl') {
-        try { await tf.setBackend('wasm'); } catch (e) {}
+        try { await tf.setBackend('wasm'); } catch (_) {}
       }
       await tf.ready();
       document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
@@ -73,70 +67,54 @@
     // ====== Camera ======
     async function setupCamera() {
       video = document.getElementById('webcam');
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }, audio: false
+      });
       video.srcObject = stream;
       await new Promise(res => (video.onloadedmetadata = () => res()));
       await video.play();
       return video;
     }
 
-    // ====== Preprocess ======
+    // ====== Preprocess (kept simple and same spirit as before) ======
     function preprocess(video) {
       const canvas = document.getElementById('offscreen');
       canvas.width = INPUT_SIZE; canvas.height = INPUT_SIZE;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       ctx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
 
+      // Keep the typical scaling to [0,1]; if you truly want raw 0–255, change div(255) to .div(1)
       return tf.tidy(() => {
-        let img = tf.browser.fromPixels(canvas).toFloat().div(255.0); // [H,W,3], 0–1
-        if (USE_STANDARDIZE) {
-          const mean = tf.tensor1d(MEAN);
-          const std  = tf.tensor1d(STD);
-          img = img.sub(mean).div(std);
-        }
-        const input = img.expandDims(0); // [1,H,W,3]
-        return input; // caller must dispose
+        const img = tf.browser.fromPixels(canvas).toFloat().div(255.0); // [H,W,3]
+        return img.expandDims(0); // [1,H,W,3]
       });
     }
 
-    // ====== Postprocess output to probabilities ======
-    async function toProbs(logitsOrProbs) {
-      // Handle: (a) Tensor [1, C], (b) raw logits, (c) already probabilities
-      const t = Array.isArray(logitsOrProbs) ? logitsOrProbs[0] : logitsOrProbs; // [1, C] or [C]
+    // ====== Use RAW OUTPUT, no softmax/normalization ======
+    async function getRawOutputs(tensorOrArray) {
+      const t = Array.isArray(tensorOrArray) ? tensorOrArray[0] : tensorOrArray; // [1,C] or [C]
       const flat = t.rank === 2 ? t.squeeze([0]) : t; // [C]
-
-      if (!APPLY_SOFTMAX) {
-        // Assume already probabilities; clip to [0,1] and renormalize defensively
-        const clipped = tf.tidy(() => flat.clipByValue(0, 1));
-        const sum = (await clipped.sum().data())[0] || 1;
-        const probs = tf.tidy(() => clipped.div(sum));
-        const arr = await probs.data();
-        clipped.dispose(); probs.dispose();
-        if (t !== flat) flat.dispose();
-        return arr;
-      } else {
-        const probsT = tf.softmax(flat);
-        const arr = await probsT.data();
-        probsT.dispose();
-        if (t !== flat) flat.dispose();
-        return arr;
-      }
+      const arr = await flat.data();                  // raw values as-is
+      if (t !== flat) flat.dispose();
+      return arr;
     }
 
     // ====== Render ======
-    function renderPredictions(probs) {
-      const items = CLASS_LABELS.map((label, i) => ({ label, p: probs[i] ?? 0 }));
+    function renderPredictions(values) {
+      const items = CLASS_LABELS.map((label, i) => ({ label, v: values[i] ?? 0 }));
       let bestIdx = 0, bestVal = -Infinity;
-      for (let i = 0; i < items.length; i++) if (items[i].p > bestVal) { bestVal = items[i].p; bestIdx = i; }
+      for (let i = 0; i < items.length; i++) if (items[i].v > bestVal) { bestVal = items[i].v; bestIdx = i; }
 
+      // If your outputs are already probabilities (0..1), this prints % nicely.
+      // If not, it will still display “as-is ×100” to keep the same visual style.
       document.getElementById('result').textContent =
-        `${items[bestIdx].label}（${(items[bestIdx].p * 100).toFixed(1)}%）`;
+        `${items[bestIdx].label}（${(items[bestIdx].v * 100).toFixed(1)}%）`;
 
       const predsEl = document.getElementById('predictions');
       predsEl.innerHTML = items.map((it, i) => `
         <div class="row ${i === bestIdx ? 'best' : ''}">
           <div>${it.label}</div>
-          <div>${(it.p * 100).toFixed(1)}%</div>
+          <div>${(it.v * 100).toFixed(1)}%</div>
         </div>
       `).join('');
     }
@@ -164,11 +142,11 @@
       try {
         const input = preprocess(video);
         let out = model.predict(input);
-        const probs = await toProbs(out);
+        const values = await getRawOutputs(out); // RAW — no conversion
         input.dispose();
         if (Array.isArray(out)) out.forEach(t => t.dispose()); else out.dispose?.();
 
-        if (frame % 2 === 0) renderPredictions(probs);
+        if (frame % 2 === 0) renderPredictions(values);
       } catch (e) {
         console.error(e);
         document.getElementById('err').textContent = String(e?.message || e);
