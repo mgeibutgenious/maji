@@ -3,7 +3,7 @@ const classLabels = ['Big Lot', 'C Press', 'Snyders'];
 
 async function setupCamera() {
   const webcamElement = document.getElementById('webcam');
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
   webcamElement.srcObject = stream;
 
   return new Promise((resolve) => {
@@ -28,13 +28,10 @@ async function predictLoop(video) {
   
   const prediction = model.predict(tensor);
   const predictions = await prediction.data();
+  const maxIndex = predictions.indexOf(Math.max(...predictions));
+  const confidence = predictions[maxIndex] * 100;
 
-  // Display confidence levels for all classes
-  let resultText = '';
-  for (let i = 0; i < classLabels.length; i++) {
-    resultText += `${classLabels[i]}: ${(predictions[i] * 100).toFixed(2)}%\n`;
-  }
-  resultP.innerText = resultText;
+  resultP.innerText = `Class: ${classLabels[maxIndex]} (${confidence.toFixed(2)}%)`;
 
   tf.dispose([tensor, prediction]);
 
