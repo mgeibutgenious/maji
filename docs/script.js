@@ -1,171 +1,124 @@
-// Put these at the top of your script (globals)
-let frameCount = 0;
-let lastReport = performance.now();
+// ====== CONFIG (edit these to match your model) ======
+const MODEL_URL    = 'tfjs_model/model.json';          // path to your TF.js model
+const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders']; // MUST match training order
+const INPUT_SIZE   = 224;                               // model input size, e.g., 224
 
+// If your training used extra preprocessing, flip these (default: same as your original – none):
+const DIVIDE_BY_255 = false;  // true ONLY if you trained with images scaled to 0–1
+const RGB_TO_BGR    = false;  // true ONLY if you trained with BGR (OpenCV) order
 
+let model, video, running = false, frame = 0;
 
-let model;
-const classLabels = ['Big Lot', 'C Press', 'Snyders'];
+// Prefer WebGL → WASM → CPU (doesn't change math)
+async function selectBackend() {
+  try { await tf.setBackend('webgl'); } catch (_) {}
+  if (tf.getBackend() !== 'webgl') {
+    try { await tf.setBackend('wasm'); } catch (_) {}
+  }
+  await tf.ready();
+}
 
-// ====== Settings ======
-const INPUT_SIZE = 224;   // must match your trained model
-const TARGET_FPS = 60;    // throttle FPS (try 8–15)
-const MODEL_PATH = './tfjs_model/model.json';
-
-// ====== Camera setup (rear camera preferred) ======
 async function setupCamera() {
-  const video = document.getElementById('webcam');
-
-  // Ensure mobile autoplay compatibility
-  video.setAttribute('playsinline', '');
-  video.muted = true; // required for autoplay on mobile
-
+  video = document.getElementById('webcam');
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: 'environment' },
-      width: { ideal: 640 },
-      height: { ideal: 640 }
-    },
+    video: { facingMode: 'environment' },
     audio: false
   });
   video.srcObject = stream;
+  await new Promise(res => (video.onloadedmetadata = () => res()));
+  await video.play();
+  return video;
+}
 
-  return new Promise((resolve) => {
-    video.onloadedmetadata = async () => {
-      await video.play();
-      resolve({ video, stream });
-    };
+// EXACT pipeline like your original:
+// fromPixels(video) -> resizeNearestNeighbor -> toFloat -> (optional BGR,/255) -> expandDims
+function preprocessFromVideo(video) {
+  return tf.tidy(() => {
+    let img = tf.browser.fromPixels(video);                   // [H,W,3] uint8 RGB
+    img = tf.image.resizeNearestNeighbor(img, [INPUT_SIZE, INPUT_SIZE]); // alignCorners=false by default
+    let f = img.toFloat();                                     // [H,W,3] float32 (0..255)
+    if (RGB_TO_BGR) f = f.reverse(-1);                         // optional channel swap
+    if (DIVIDE_BY_255) f = f.div(255);                         // optional scaling
+    return f.expandDims(0);                                    // [1,H,W,3]
   });
 }
 
-// ====== Load model and warm up ======
+// Get raw outputs as-is (no softmax/normalization)
+async function getRawOutputs(tensorOrArray) {
+  const t = Array.isArray(tensorOrArray) ? tensorOrArray[0] : tensorOrArray; // [1,C] or [C]
+  const flat = t.rank === 2 ? t.squeeze([0]) : t; // [C]
+  const arr = await flat.data();                  // raw numbers
+  if (t !== flat) flat.dispose();
+  return arr;
+}
+
+function renderResult(values) {
+  const items = CLASS_LABELS.map((label, i) => ({ label, v: values[i] ?? 0 }));
+  let bestIdx = 0, bestVal = -Infinity;
+  for (let i = 0; i < items.length; i++) if (items[i].v > bestVal) { bestVal = items[i].v; bestIdx = i; }
+
+  // Keep your original style: show label + “%” (purely visual; math unchanged)
+  const best = items[bestIdx];
+  document.getElementById('result').textContent =
+    `${best.label}（${(best.v * 100).toFixed(1)}%）`;
+}
+
+// Warm up once to compile kernels/shaders
 async function loadModel() {
-  try {
-    await tf.setBackend('webgl');
-  } catch {
-    await tf.setBackend('wasm');
-  }
-  await tf.ready();
-
-  model = await tf.loadLayersModel(MODEL_PATH);
-  console.log('✅ Model loaded');
-
-  // Warm up model
+  model = await tf.loadLayersModel(MODEL_URL);
   tf.tidy(() => {
-    const dummy = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
-    model.predict(dummy);
+    const z = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
+    const y = model.predict(z);
+    if (Array.isArray(y)) y.forEach(t => t.dispose()); else y.dispose?.();
   });
 }
 
-// ====== Square crop via canvas ======
-const canvas = document.createElement('canvas');
-canvas.width = INPUT_SIZE;
-canvas.height = INPUT_SIZE;
-const ctx = canvas.getContext('2d');
+async function loop() {
+  if (!running) return;
+  await tf.nextFrame(); // keep UI responsive
+  frame++;
 
-function drawSquareCropToCanvas(video) {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!vw || !vh) return false;
+  try {
+    const input = preprocessFromVideo(video);
+    const out = model.predict(input);
+    const values = await getRawOutputs(out); // RAW
+    input.dispose();
+    if (Array.isArray(out)) out.forEach(t => t.dispose()); else out.dispose?.();
 
-  const side = Math.min(vw, vh);
-  const sx = (vw - side) / 2;
-  const sy = (vh - side) / 2;
-  ctx.drawImage(video, sx, sy, side, side, 0, 0, INPUT_SIZE, INPUT_SIZE);
-  return true;
-}
-
-// ====== Prediction loop ======
-async function predictLoop(video) {
-  const resultP = document.getElementById('result');
-  const frameInterval = 1000 / TARGET_FPS;
-  let lastTime = 0;
-
-  const loop = async (ts) => {
-    try {
-      if (ts - lastTime < frameInterval) {
-        requestAnimationFrame(loop);
-        return;
-      }
-      lastTime = ts;
-
-      if (!drawSquareCropToCanvas(video)) {
-        requestAnimationFrame(loop);
-        return;
-      }
-
-      let probs;
-      tf.tidy(() => {
-        const img = tf.browser.fromPixels(canvas)
-          .toFloat()
-          .div(255)
-          .expandDims(0);
-        const pred = model.predict(img);
-        probs = pred.dataSync();
-      });
-
-      // === Format output ===
-      const probsArr = Array.from(probs);
-      const maxIdx = probsArr.indexOf(Math.max(...probsArr));
-
-      let html = '';
-      for (let i = 0; i < classLabels.length; i++) {
-        const pct = (probsArr[i] * 100).toFixed(2) + '%';
-        if (i === maxIdx) {
-          html += `<div style="font-weight:700; color:#14833b;">${classLabels[i]}: ${pct}</div>`;
-        } else {
-          html += `<div>${classLabels[i]}: ${pct}</div>`;
-        }
-      }
-      resultP.innerHTML = html;
-
-    } catch (err) {
-      console.error('Inference error:', err);
-      if (tf.getBackend() === 'webgl') {
-        try {
-          await tf.setBackend('wasm');
-          await tf.ready();
-          console.warn('⚠️ Switched backend to WASM after error.');
-        } catch (e) {
-          console.error('Backend switch failed:', e);
-        }
-      }
-    } finally {
-      requestAnimationFrame(loop);
-    }
-  };
+    // Update UI (every frame or throttle if you like)
+    renderResult(values);
+  } catch (e) {
+    console.error(e);
+    document.getElementById('result').textContent = 'エラー: ' + (e?.message || e);
+  }
 
   requestAnimationFrame(loop);
 }
 
-// ====== Start ======
-async function start() {
+function stop() {
+  running = false;
+}
+
+function disposeAll() {
+  stop();
+  if (model) { model.dispose(); model = undefined; }
+  if (video && video.srcObject) {
+    for (const track of video.srcObject.getVideoTracks()) track.stop();
+    video.srcObject = null;
+  }
+  tf.engine().disposeVariables();
+  tf.backend().dispose?.();
+}
+
+// Auto-start on load (same behavior as your original)
+window.addEventListener('DOMContentLoaded', async () => {
+  await selectBackend();
+  await setupCamera();
   await loadModel();
-  const { video, stream } = await setupCamera();
-  await predictLoop(video);
+  running = true;
+  requestAnimationFrame(loop);
+});
 
-  const cleanup = () => {
-    stream.getTracks().forEach(t => t.stop());
-    if (model) model.dispose();
-    tf.engine().reset();
-  };
-  window.addEventListener('pagehide', cleanup);
-  window.addEventListener('beforeunload', cleanup);
-}
-
-start();
-// Inside the end of your loop, after you update UI:
-frameCount++;
-const now = performance.now();
-if (now - lastReport > 2000) { // every ~2s
-  const mem = tf.engine().memory();
-  console.log(
-    `fps≈${(frameCount/((now-lastReport)/1000)).toFixed(1)}`,
-    `tensors=${mem.numTensors}`,
-    `bytes=${(mem.numBytes/1e6).toFixed(2)}MB`,
-    `backend=${tf.getBackend()}`
-  );
-  frameCount = 0;
-  lastReport = now;
-}
-
+// Clean up on page exit
+window.addEventListener('pagehide', disposeAll);
+window.addEventListener('beforeunload', disposeAll);
