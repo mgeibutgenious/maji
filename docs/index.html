@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>機械学習により金銀滓自動仕訳</title>
-  <!-- Use the same TF.js you were using -->
+  <!-- Same include style as your original (latest TF.js); pin to a version if you want reproducibility -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
   <style>
     body { display:flex; flex-direction:column; align-items:center; justify-content:flex-start; font-family: Arial, sans-serif; margin:0; padding:16px; background:#f4f4f4; }
@@ -25,12 +25,9 @@
 </head>
 <body>
   <h1>機械学習により金銀滓自動仕訳</h1>
+  <video id="webcam" autoplay playsinline muted></video>
+  <p id="result">少しお待ちください～</p>
 
-  <!-- Your original UI elements -->
-  <video id="webcam" autoplay playsinline muted width="640" height="480"></video>
-  <pre id="result">少しお待ちください～</pre>
-
-  <!-- New panel UI (purely a mirror; no new model loop) -->
   <div class="panel">
     <div class="topline">
       <strong>予測結果</strong>
@@ -45,72 +42,152 @@
     <div id="err"></div>
   </div>
 
-  <!-- Your original logic (stays in control of the math & loop) -->
-  <script src="script.js"></script>
-
-  <!-- Mirror layer: reads your results and displays them in the panel WITHOUT changing calculations -->
   <script>
-    // Set labels here for the vertical list (optional if you expose window.lastOutputs)
-    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders'];
+    // ========= CONFIG =========
+    const MODEL_URL   = 'tfjs_model/model.json';                 // set to your model path
+    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders'];      // training output order
+    const INPUT_SIZE  = 224;                                     // must match model input
 
-    // Show active backend (doesn't affect your script.js math)
-    (async () => {
-      try { await tf.setBackend(tf.getBackend()); } catch(_) {}
+    // Keep EXACT behavior: no softmax, no mean/std. Flip these ONLY if training used them:
+    const DIVIDE_BY_255 = false; // true iff training divided inputs by 255
+    const RGB_TO_BGR    = false; // true iff training expected BGR channel order (OpenCV)
+
+    // ========= Globals =========
+    let model, video, running = false, frame = 0;
+
+    // Prefer WebGL → WASM → CPU
+    async function selectBackend() {
+      try { await tf.setBackend('webgl'); } catch (_) {}
+      if (tf.getBackend() !== 'webgl') {
+        try { await tf.setBackend('wasm'); } catch (_) {}
+      }
       await tf.ready();
-      const b = document.getElementById('backend');
-      if (b) b.textContent = `backend: ${tf.getBackend()}`;
-    })();
-
-    // Start/Stop buttons: we just click your script.js's own controls if it exposes functions.
-    // If your script.js defines global start()/stop(), these will call them; otherwise they do nothing.
-    document.getElementById('startBtn').addEventListener('click', () => {
-      if (typeof window.start === 'function') window.start();
-      document.getElementById('status').textContent = '推論中…';
-    });
-    document.getElementById('stopBtn').addEventListener('click', () => {
-      if (typeof window.stop === 'function') window.stop();
-      document.getElementById('status').textContent = '停止中';
-    });
-
-    // 1) Always mirror the exact text your script.js writes into #result
-    const resultEl = document.getElementById('result');
-    const predsEl  = document.getElementById('predictions');
-
-    // MutationObserver will update the panel whenever your script.js changes #result
-    const obs = new MutationObserver(() => {
-      const text = resultEl.textContent || '';
-      // Put that same text at the top of the panel as a single “best” row
-      predsEl.innerHTML = `
-        <div class="row best">
-          <div>${text}</div>
-          <div></div>
-        </div>
-      `;
-    });
-    obs.observe(resultEl, { characterData: true, childList: true, subtree: true });
-
-    // 2) OPTIONAL: If you expose raw outputs in your script.js as window.lastOutputs = [v0, v1, v2],
-    // we'll render the full vertical list below the mirrored line (no math changes).
-    function renderListFromLastOutputs() {
-      if (!Array.isArray(window.lastOutputs)) return;
-      const values = window.lastOutputs;
-      let bestIdx = 0, bestVal = -Infinity;
-      for (let i = 0; i < values.length; i++) if (values[i] > bestVal) { bestVal = values[i]; bestIdx = i; }
-
-      const list = CLASS_LABELS.map((label, i) => `
-        <div class="row ${i === bestIdx ? 'best' : ''}">
-          <div>${label}</div>
-          <div>${(values[i] * 100).toFixed(1)}%</div>
-        </div>
-      `).join('');
-
-      // Keep the very first line (mirrored text) and append the list
-      const first = predsEl.firstElementChild?.outerHTML || '';
-      predsEl.innerHTML = first + list;
+      document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
     }
 
-    // Poll gently for optional lastOutputs (no impact if you don't add it)
-    setInterval(renderListFromLastOutputs, 300);
+    // Camera
+    async function setupCamera() {
+      video = document.getElementById('webcam');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }, audio: false
+      });
+      video.srcObject = stream;
+      await new Promise(res => (video.onloadedmetadata = () => res()));
+      await video.play();
+      return video;
+    }
+
+    // Preprocess: from <video> → resizeNearestNeighbor (default alignCorners=false) → toFloat
+    function preprocessFromVideo(video) {
+      return tf.tidy(() => {
+        let img = tf.browser.fromPixels(video);                            // [H,W,3] uint8 RGB
+        img = tf.image.resizeNearestNeighbor(img, [INPUT_SIZE, INPUT_SIZE]); // default alignCorners=false
+        let f = img.toFloat();                                             // [H,W,3] float32 (0..255)
+        if (RGB_TO_BGR) f = f.reverse(-1);                                 // optional channel swap
+        if (DIVIDE_BY_255) f = f.div(255);                                 // optional scaling
+        return f.expandDims(0);                                            // [1,H,W,3]
+      });
+    }
+
+    // Raw outputs as-is (no softmax/normalization)
+    async function getRawOutputs(tensorOrArray) {
+      const t = Array.isArray(tensorOrArray) ? tensorOrArray[0] : tensorOrArray; // [1,C] or [C]
+      const flat = t.rank === 2 ? t.squeeze([0]) : t; // [C]
+      const arr = await flat.data();                  // raw numbers
+      if (t !== flat) flat.dispose();
+      return arr;
+    }
+
+    // Render vertical list; best highlighted
+    function renderPredictions(values) {
+      const items = CLASS_LABELS.map((label, i) => ({ label, v: values[i] ?? 0 }));
+      let bestIdx = 0, bestVal = -Infinity;
+      for (let i = 0; i < items.length; i++) if (items[i].v > bestVal) { bestVal = items[i].v; bestIdx = i; }
+
+      // Keep your UI style; multiply by 100 only for display (does not change calc)
+      document.getElementById('result').textContent =
+        `${items[bestIdx].label}（${(items[bestIdx].v * 100).toFixed(1)}%）`;
+
+      const predsEl = document.getElementById('predictions');
+      predsEl.innerHTML = items.map((it, i) => `
+        <div class="row ${i === bestIdx ? 'best' : ''}">
+          <div>${it.label}</div>
+          <div>${(it.v * 100).toFixed(1)}%</div>
+        </div>
+      `).join('');
+    }
+
+    // Load & warmup
+    async function loadModel() {
+      model = await tf.loadLayersModel(MODEL_URL);
+      // warmup: compiles kernels/shaders
+      tf.tidy(() => {
+        const z = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
+        const y = model.predict(z);
+        if (Array.isArray(y)) y.forEach(t => t.dispose()); else y.dispose?.();
+      });
+    }
+
+    // Main loop (no softmax; uses exact pipeline)
+    async function loop() {
+      if (!running) return;
+      await tf.nextFrame(); // yield to UI
+      frame++;
+
+      try {
+        const input = preprocessFromVideo(video);
+        const out = model.predict(input);
+        const values = await getRawOutputs(out);
+        input.dispose();
+        if (Array.isArray(out)) out.forEach(t => t.dispose()); else out.dispose?.();
+
+        if (frame % 2 === 0) renderPredictions(values);
+      } catch (e) {
+        console.error(e);
+        document.getElementById('err').textContent = String(e?.message || e);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function stop() {
+      running = false;
+      document.getElementById('status').textContent = '停止中';
+    }
+
+    async function start() {
+      document.getElementById('err').textContent = '';
+      if (!video) await setupCamera();
+      if (!model) await loadModel();
+      running = true;
+      document.getElementById('status').textContent = '推論中…';
+      requestAnimationFrame(loop);
+    }
+
+    function disposeAll() {
+      stop();
+      if (model) { model.dispose(); model = undefined; }
+      if (video && video.srcObject) {
+        for (const track of video.srcObject.getVideoTracks()) track.stop();
+        video.srcObject = null;
+      }
+      tf.engine().disposeVariables();
+      tf.backend().dispose?.();
+    }
+
+    // Buttons
+    document.getElementById('startBtn')?.addEventListener('click', start);
+    document.getElementById('stopBtn')?.addEventListener('click', stop);
+
+    // Init
+    (async () => {
+      await selectBackend();
+      // Auto-start if you want:
+      // await start();
+    })();
+
+    // Cleanup on page exit
+    window.addEventListener('pagehide', disposeAll);
+    window.addEventListener('beforeunload', disposeAll);
   </script>
 </body>
 </html>
