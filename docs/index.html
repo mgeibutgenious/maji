@@ -1,47 +1,334 @@
 <!DOCTYPE html>
-<html>
+<html lang="ja">
 <head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>機械学習により金銀滓自動仕訳</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
-  <script src="script.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
   <style>
-    body {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      font-family: Arial, sans-serif;
-      margin: 0;
-      padding: 0;
-      background: #f4f4f4;
-    }
-    h1 {
-      margin: 20px;
-      font-size: 2em;
-    }
-    video {
-      width: 90vw;        /* 90% of screen width */
-      height: 90vw;       /* same as width → square */
-      max-width: 400px;   /* limit size for big screens */
-      max-height: 400px;
-      border: 3px solid #333;
-      border-radius: 10px;
-      object-fit: cover;  /* fills square without distortion */
-    }
-    #result {
-      font-size: 1.8em;
-      margin-top: 15px;
-      font-weight: bold;
-    }
+    body { display:flex; flex-direction:column; align-items:center; justify-content:flex-start; font-family: Arial, sans-serif; margin:0; padding:16px; background:#f4f4f4; }
+    h1 { margin: 12px 0 8px; font-size: 1.6em; text-align:center; }
+    video { width: 90vw; height: 90vw; max-width: 400px; max-height: 400px; border: 3px solid #333; border-radius: 10px; object-fit: cover; background:#111; }
+    #result { font-size: 1.4em; margin-top: 12px; font-weight: bold; }
+    .panel { width: 90vw; max-width: 400px; background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:12px; margin-top:12px; }
+    .topline { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; font-size:12px; }
+    .row { display:flex; justify-content:space-between; padding:6px 8px; border-radius:8px; }
+    .row + .row { margin-top: 6px; }
+    .row.best { font-weight:800; color:#065f46; background:#ecfdf5; }
+    .muted { color:#6b7280; font-size:12px; }
+    .controls { margin-top:8px; display:flex; gap:8px; }
+    .controls > button { padding:8px 12px; border-radius:8px; border:1px solid #d1d5db; background:#fff; cursor:pointer; }
+    #err { color:#b91c1c; white-space: pre-wrap; margin-top:6px; font-size:12px; }
+    #offscreen { display:none; }
   </style>
 </head>
 <body>
   <h1>機械学習により金銀滓自動仕訳</h1>
   <video id="webcam" autoplay playsinline muted></video>
   <p id="result">少しお待ちください～</p>
+
+  <div class="panel">
+    <div class="topline">
+      <strong>予測結果</strong>
+      <span class="badge" id="backend">backend: …</span>
+    </div>
+    <div id="predictions"></div>
+    <div class="controls">
+      <button id="startBtn">開始</button>
+      <button id="stopBtn">停止</button>
+    </div>
+    <div class="muted" id="status"></div>
+    <div id="err"></div>
+  </div>
+
+  <canvas id="offscreen" width="224" height="224"></canvas>
+
+  <script>
+    // ---- 設定 ----
+    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders']; // ← 実際のクラス名に合わせて変更
+    const MODEL_URL = 'tfjs_model/model.json';               // ← 実際の配置に合わせて変更
+    const INPUT_SIZE = 224;                                  // ← モデルの入力サイズに合わせて変更
+
+    let model, video, running = false, frame = 0;
+
+    async function selectBackend() {
+      try { await tf.setBackend('webgl'); } catch (e) {}
+      if (tf.getBackend() !== 'webgl') {
+        try { await tf.setBackend('wasm'); } catch (e) {}
+      }
+      await tf.ready();
+      document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
+    }
+
+    async function setupCamera() {
+      video = document.getElementById('webcam');
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      video.srcObject = stream;
+      await new Promise(res => (video.onloadedmetadata = () => res()));
+      await video.play();
+      return video;
+    }
+
+    function preprocess(video) {
+      const canvas = document.getElementById('offscreen');
+      canvas.width = INPUT_SIZE; canvas.height = INPUT_SIZE; // 念のため同期
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
+      return tf.tidy(() => {
+        const img = tf.browser.fromPixels(canvas);
+        const input = img.toFloat().div(255).expandDims(0); // [1,H,W,3]
+        return input; // 呼び出し側でdispose
+      });
+    }
+
+    function renderPredictions(probs) {
+      // ベストクラス表示（#result）と、リスト表示の両方
+      const items = CLASS_LABELS.map((label, i) => ({ label, p: probs[i] ?? 0 }));
+      let bestIdx = 0, bestVal = -Infinity;
+      for (let i = 0; i < items.length; i++) if (items[i].p > bestVal) { bestVal = items[i].p; bestIdx = i; }
+      document.getElementById('result').textContent = `${items[bestIdx].label}（${(items[bestIdx].p*100).toFixed(1)}%）`;
+
+      const predsEl = document.getElementById('predictions');
+      predsEl.innerHTML = items.map((it, i) => `
+        <div class="row ${i === bestIdx ? 'best' : ''}">
+          <div>${it.label}</div>
+          <div>${(it.p * 100).toFixed(1)}%</div>
+        </div>
+      `).join('');
+    }
+
+    async function warmup() {
+      tf.tidy(() => {
+        const z = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
+        const y = model.predict(z);
+        if (Array.isArray(y)) y.forEach(t => t.dispose()); else y.dispose?.();
+      });
+    }
+
+    async function loadModel() {
+      model = await tf.loadLayersModel(MODEL_URL);
+      await warmup();
+    }
+
+    async function loop() {
+      if (!running) return;
+      await tf.nextFrame();
+      frame++;
+      try {
+        const input = preprocess(video);
+        let logits = model.predict(input);
+        const probsTensor = tf.tidy(() => Array.isArray(logits) ? tf.softmax(logits[0]) : tf.softmax(logits));
+        const probs = await probsTensor.data();
+        probsTensor.dispose();
+        input.dispose();
+        if (Array.isArray(logits)) logits.forEach(t => t.dispose()); else logits.dispose?.();
+        if (frame % 2 === 0) renderPredictions(probs);
+      } catch (e) {
+        console.error(e);
+        document.getElementById('err').textContent = String(e?.message || e);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function stop() {
+      running = false;
+      document.getElementById('status').textContent = '停止中';
+    }
+
+    async function start() {
+      document.getElementById('err').textContent = '';
+      if (!video) await setupCamera();
+      if (!model) await loadModel();
+      running = true;
+      document.getElementById('status').textContent = '推論中…';
+      requestAnimationFrame(loop);
+    }
+
+    function disposeAll() {
+      stop();
+      if (model) { model.dispose(); model = undefined; }
+      if (video && video.srcObject) {
+        for (const track of video.srcObject.getVideoTracks()) track.stop();
+        video.srcObject = null;
+      }
+      tf.engine().disposeVariables();
+      tf.backend().dispose?.();
+    }
+
+    document.getElementById('startBtn').addEventListener('click', start);
+    document.getElementById('stopBtn').addEventListener('click', stop);
+
+    (async () => { await selectBackend(); /* 自動開始したい場合は以下を有効化 */ /* await start(); */ })();
+    window.addEventListener('pagehide', disposeAll);
+    window.addEventListener('beforeunload', disposeAll);
+  </script>
 </body>
 </html>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>機械学習により金銀滓自動仕訳</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <style>
+    body { display:flex; flex-direction:column; align-items:center; justify-content:flex-start; font-family: Arial, sans-serif; margin:0; padding:16px; background:#f4f4f4; }
+    h1 { margin: 12px 0 8px; font-size: 1.6em; text-align:center; }
+    video { width: 90vw; height: 90vw; max-width: 400px; max-height: 400px; border: 3px solid #333; border-radius: 10px; object-fit: cover; background:#111; }
+    #result { font-size: 1.4em; margin-top: 12px; font-weight: bold; }
+    .panel { width: 90vw; max-width: 400px; background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:12px; margin-top:12px; }
+    .topline { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; font-size:12px; }
+    .row { display:flex; justify-content:space-between; padding:6px 8px; border-radius:8px; }
+    .row + .row { margin-top: 6px; }
+    .row.best { font-weight:800; color:#065f46; background:#ecfdf5; }
+    .muted { color:#6b7280; font-size:12px; }
+    .controls { margin-top:8px; display:flex; gap:8px; }
+    .controls > button { padding:8px 12px; border-radius:8px; border:1px solid #d1d5db; background:#fff; cursor:pointer; }
+    #err { color:#b91c1c; white-space: pre-wrap; margin-top:6px; font-size:12px; }
+    #offscreen { display:none; }
+  </style>
+</head>
+<body>
+  <h1>機械学習により金銀滓自動仕訳</h1>
+  <video id="webcam" autoplay playsinline muted></video>
+  <p id="result">少しお待ちください～</p>
 
+  <div class="panel">
+    <div class="topline">
+      <strong>予測結果</strong>
+      <span class="badge" id="backend">backend: …</span>
+    </div>
+    <div id="predictions"></div>
+    <div class="controls">
+      <button id="startBtn">開始</button>
+      <button id="stopBtn">停止</button>
+    </div>
+    <div class="muted" id="status"></div>
+    <div id="err"></div>
+  </div>
 
+  <canvas id="offscreen" width="224" height="224"></canvas>
 
+  <script>
+    // ---- 設定 ----
+    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders']; // ← 実際のクラス名に合わせて変更
+    const MODEL_URL = 'tfjs_model/model.json';               // ← 実際の配置に合わせて変更
+    const INPUT_SIZE = 224;                                  // ← モデルの入力サイズに合わせて変更
 
+    let model, video, running = false, frame = 0;
+
+    async function selectBackend() {
+      try { await tf.setBackend('webgl'); } catch (e) {}
+      if (tf.getBackend() !== 'webgl') {
+        try { await tf.setBackend('wasm'); } catch (e) {}
+      }
+      await tf.ready();
+      document.getElementById('backend').textContent = `backend: ${tf.getBackend()}`;
+    }
+
+    async function setupCamera() {
+      video = document.getElementById('webcam');
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      video.srcObject = stream;
+      await new Promise(res => (video.onloadedmetadata = () => res()));
+      await video.play();
+      return video;
+    }
+
+    function preprocess(video) {
+      const canvas = document.getElementById('offscreen');
+      canvas.width = INPUT_SIZE; canvas.height = INPUT_SIZE; // 念のため同期
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
+      return tf.tidy(() => {
+        const img = tf.browser.fromPixels(canvas);
+        const input = img.toFloat().div(255).expandDims(0); // [1,H,W,3]
+        return input; // 呼び出し側でdispose
+      });
+    }
+
+    function renderPredictions(probs) {
+      // ベストクラス表示（#result）と、リスト表示の両方
+      const items = CLASS_LABELS.map((label, i) => ({ label, p: probs[i] ?? 0 }));
+      let bestIdx = 0, bestVal = -Infinity;
+      for (let i = 0; i < items.length; i++) if (items[i].p > bestVal) { bestVal = items[i].p; bestIdx = i; }
+      document.getElementById('result').textContent = `${items[bestIdx].label}（${(items[bestIdx].p*100).toFixed(1)}%）`;
+
+      const predsEl = document.getElementById('predictions');
+      predsEl.innerHTML = items.map((it, i) => `
+        <div class="row ${i === bestIdx ? 'best' : ''}">
+          <div>${it.label}</div>
+          <div>${(it.p * 100).toFixed(1)}%</div>
+        </div>
+      `).join('');
+    }
+
+    async function warmup() {
+      tf.tidy(() => {
+        const z = tf.zeros([1, INPUT_SIZE, INPUT_SIZE, 3]);
+        const y = model.predict(z);
+        if (Array.isArray(y)) y.forEach(t => t.dispose()); else y.dispose?.();
+      });
+    }
+
+    async function loadModel() {
+      model = await tf.loadLayersModel(MODEL_URL);
+      await warmup();
+    }
+
+    async function loop() {
+      if (!running) return;
+      await tf.nextFrame();
+      frame++;
+      try {
+        const input = preprocess(video);
+        let logits = model.predict(input);
+        const probsTensor = tf.tidy(() => Array.isArray(logits) ? tf.softmax(logits[0]) : tf.softmax(logits));
+        const probs = await probsTensor.data();
+        probsTensor.dispose();
+        input.dispose();
+        if (Array.isArray(logits)) logits.forEach(t => t.dispose()); else logits.dispose?.();
+        if (frame % 2 === 0) renderPredictions(probs);
+      } catch (e) {
+        console.error(e);
+        document.getElementById('err').textContent = String(e?.message || e);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function stop() {
+      running = false;
+      document.getElementById('status').textContent = '停止中';
+    }
+
+    async function start() {
+      document.getElementById('err').textContent = '';
+      if (!video) await setupCamera();
+      if (!model) await loadModel();
+      running = true;
+      document.getElementById('status').textContent = '推論中…';
+      requestAnimationFrame(loop);
+    }
+
+    function disposeAll() {
+      stop();
+      if (model) { model.dispose(); model = undefined; }
+      if (video && video.srcObject) {
+        for (const track of video.srcObject.getVideoTracks()) track.stop();
+        video.srcObject = null;
+      }
+      tf.engine().disposeVariables();
+      tf.backend().dispose?.();
+    }
+
+    document.getElementById('startBtn').addEventListener('click', start);
+    document.getElementById('stopBtn').addEventListener('click', stop);
+
+    (async () => { await selectBackend(); /* 自動開始したい場合は以下を有効化 */ /* await start(); */ })();
+    window.addEventListener('pagehide', disposeAll);
+    window.addEventListener('beforeunload', disposeAll);
+  </script>
+</body>
+</html>
