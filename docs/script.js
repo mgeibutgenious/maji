@@ -9,7 +9,7 @@ const classLabels = ['Big Lot', 'C Press', 'Snyders'];
 
 // ====== Settings ======
 const INPUT_SIZE = 224;   // must match your trained model
-const TARGET_FPS = 20;    // throttle FPS (try 8–15)
+const TARGET_FPS = 60;    // throttle FPS (try 8–15)
 const MODEL_PATH = './tfjs_model/model.json';
 
 // ====== Camera setup (rear camera preferred) ======
@@ -168,3 +168,4 @@ if (now - lastReport > 2000) { // every ~2s
   frameCount = 0;
   lastReport = now;
 }
+
