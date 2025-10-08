@@ -1,16 +1,116 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Live Camera Classifier</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>機械学習により金銀滓自動仕訳</title>
+  <!-- Use the same TF.js you were using -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <style>
+    body { display:flex; flex-direction:column; align-items:center; justify-content:flex-start; font-family: Arial, sans-serif; margin:0; padding:16px; background:#f4f4f4; }
+    h1 { margin: 20px 0 8px; font-size: 1.8em; text-align:center; }
+    video { width: 90vw; height: 90vw; max-width: 400px; max-height: 400px; border: 3px solid #333; border-radius: 10px; object-fit: cover; background:#111; }
+    #result { font-size: 1.6em; margin-top: 12px; font-weight: bold; }
+    .panel { width: 90vw; max-width: 400px; background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:12px; margin-top:12px; }
+    .topline { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; font-size:12px; }
+    .row { display:flex; justify-content:space-between; padding:6px 8px; border-radius:8px; }
+    .row + .row { margin-top: 6px; }
+    .row.best { font-weight:800; color:#065f46; background:#ecfdf5; }
+    .muted { color:#6b7280; font-size:12px; }
+    .controls { margin-top:8px; display:flex; gap:8px; }
+    .controls > button { padding:8px 12px; border-radius:8px; border:1px solid #d1d5db; background:#fff; cursor:pointer; }
+    #err { color:#b91c1c; white-space: pre-wrap; margin-top:6px; font-size:12px; }
+  </style>
 </head>
 <body>
-  <video id="webcam" autoplay playsinline width="640" height="480"></video>
-  <pre id="result"></pre>
+  <h1>機械学習により金銀滓自動仕訳</h1>
+
+  <!-- Your original UI elements -->
+  <video id="webcam" autoplay playsinline muted width="640" height="480"></video>
+  <pre id="result">少しお待ちください～</pre>
+
+  <!-- New panel UI (purely a mirror; no new model loop) -->
+  <div class="panel">
+    <div class="topline">
+      <strong>予測結果</strong>
+      <span class="badge" id="backend">backend: …</span>
+    </div>
+    <div id="predictions"></div>
+    <div class="controls">
+      <button id="startBtn">開始</button>
+      <button id="stopBtn">停止</button>
+    </div>
+    <div class="muted" id="status"></div>
+    <div id="err"></div>
+  </div>
+
+  <!-- Your original logic (stays in control of the math & loop) -->
   <script src="script.js"></script>
+
+  <!-- Mirror layer: reads your results and displays them in the panel WITHOUT changing calculations -->
+  <script>
+    // Set labels here for the vertical list (optional if you expose window.lastOutputs)
+    const CLASS_LABELS = ['Big Lot', 'C Press', 'Snyders'];
+
+    // Show active backend (doesn't affect your script.js math)
+    (async () => {
+      try { await tf.setBackend(tf.getBackend()); } catch(_) {}
+      await tf.ready();
+      const b = document.getElementById('backend');
+      if (b) b.textContent = `backend: ${tf.getBackend()}`;
+    })();
+
+    // Start/Stop buttons: we just click your script.js's own controls if it exposes functions.
+    // If your script.js defines global start()/stop(), these will call them; otherwise they do nothing.
+    document.getElementById('startBtn').addEventListener('click', () => {
+      if (typeof window.start === 'function') window.start();
+      document.getElementById('status').textContent = '推論中…';
+    });
+    document.getElementById('stopBtn').addEventListener('click', () => {
+      if (typeof window.stop === 'function') window.stop();
+      document.getElementById('status').textContent = '停止中';
+    });
+
+    // 1) Always mirror the exact text your script.js writes into #result
+    const resultEl = document.getElementById('result');
+    const predsEl  = document.getElementById('predictions');
+
+    // MutationObserver will update the panel whenever your script.js changes #result
+    const obs = new MutationObserver(() => {
+      const text = resultEl.textContent || '';
+      // Put that same text at the top of the panel as a single “best” row
+      predsEl.innerHTML = `
+        <div class="row best">
+          <div>${text}</div>
+          <div></div>
+        </div>
+      `;
+    });
+    obs.observe(resultEl, { characterData: true, childList: true, subtree: true });
+
+    // 2) OPTIONAL: If you expose raw outputs in your script.js as window.lastOutputs = [v0, v1, v2],
+    // we'll render the full vertical list below the mirrored line (no math changes).
+    function renderListFromLastOutputs() {
+      if (!Array.isArray(window.lastOutputs)) return;
+      const values = window.lastOutputs;
+      let bestIdx = 0, bestVal = -Infinity;
+      for (let i = 0; i < values.length; i++) if (values[i] > bestVal) { bestVal = values[i]; bestIdx = i; }
+
+      const list = CLASS_LABELS.map((label, i) => `
+        <div class="row ${i === bestIdx ? 'best' : ''}">
+          <div>${label}</div>
+          <div>${(values[i] * 100).toFixed(1)}%</div>
+        </div>
+      `).join('');
+
+      // Keep the very first line (mirrored text) and append the list
+      const first = predsEl.firstElementChild?.outerHTML || '';
+      predsEl.innerHTML = first + list;
+    }
+
+    // Poll gently for optional lastOutputs (no impact if you don't add it)
+    setInterval(renderListFromLastOutputs, 300);
+  </script>
 </body>
 </html>
-
-
-
